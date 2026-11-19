@@ -4,6 +4,7 @@
 //! longer lives and dies with the game server's Rust extension. All durable
 //! state lives in SurrealDB; this process is stateless.
 
+mod cad;
 mod config;
 mod cors;
 mod db;
@@ -11,7 +12,10 @@ mod routes;
 
 use std::sync::Arc;
 
-use axum::{Router, routing::get};
+use axum::{
+    routing::{get, put},
+    Router,
+};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -23,7 +27,7 @@ use db::Db;
 pub struct AppState {
     /// SurrealDB client. `None` when the database could not be reached at
     /// startup — the API still serves /health so the container stays
-    /// observable; persistence routes (coming later) will require it.
+    /// observable; the CAD persistence routes answer 503 while it is `None`.
     pub db: Option<Arc<Db>>,
 }
 
@@ -62,6 +66,15 @@ async fn main() -> Result<(), String> {
 
     let app = Router::new()
         .route("/health", get(routes::health))
+        .route(
+            "/cad/groups",
+            get(cad::list_groups).post(cad::register_group),
+        )
+        .route("/cad/groups/{id}", get(cad::get_group))
+        .route("/cad/groups/{id}/status", put(cad::update_group_status))
+        .route("/cad/groups/{id}/contracts", get(cad::list_group_contracts))
+        .route("/cad/contracts", get(cad::list_contracts))
+        .route("/cad/contracts/{id}", get(cad::get_contract))
         .layer(cors::arma_cors_layer())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

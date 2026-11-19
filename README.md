@@ -54,11 +54,53 @@ cargo run -p forge-api
 
 Arma 3's `webRequest` forces the `Origin` header to start with `arma://` (the `"origin"` key in the SQF request hashmap, e.g. `"forge"` → `Origin: arma://forge`) and sends a CORS preflight (`OPTIONS`) before every request. A wildcard `Access-Control-Allow-Origin: *` does not satisfy that, so the API echoes back the exact `arma://*` Origin it receives and answers preflights for `GET`/`POST`/`PUT`/`DELETE`/`OPTIONS`. See `crates/forge-api/src/cors.rs` and the example in `examples/sqf/webrequest_health.sqf`.
 
+## CAD: groups, group status, contract availability
+
+The CAD slice of the API covers exactly three things: groups, group
+status, and which contracts are available vs not available. No
+dispatching, units, incidents, or messaging.
+
+Grounded in the original Forge implementation
+(`lib/services/src/task.rs`, `arma/server/addons/cad/functions/fnc_initGroupRepository.sqf`,
+`fnc_initCadStore.sqf`, and the CAD UI in `arma/client/addons/cad`):
+
+- **Group status** is one of `available`, `en_route`, `on_task`,
+  `holding`, `danger`, `unavailable` (default `available`; roles are
+  `infantry`, `recon`, `armor`, `air`, `logistics`, `support`, default
+  `infantry`). Anything else is rejected with `400 Invalid group status`.
+- **Contract availability is derived, never stored**: a contract is
+  available exactly when its status is `available`. Assigned, active,
+  locked, succeeded and failed contracts are all unavailable.
+- **Assignment** is part of availability state: contract responses
+  expose `assignment` (`groupId`, `groupCallsign`, `assignedByUid`,
+  `assignedByName`, `assignedAt`, `note`, `accepted`, `acceptedAt`) and
+  `assignmentState` (`unassigned` / `assigned` / `accepted` / `active`).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/cad/groups` | List groups (`?status=`, `?role=` filters) |
+| `POST` | `/cad/groups` | Register / re-register a group (201 new, 200 existing) |
+| `GET` | `/cad/groups/:id` | One group |
+| `PUT` | `/cad/groups/:id/status` | Update a group's status (`{"status": "en_route"}`) |
+| `GET` | `/cad/groups/:id/contracts` | Contracts assigned to one group |
+| `GET` | `/cad/contracts` | List contracts (`?available=true/false`, `?status=`, `?group_id=`) |
+| `GET` | `/cad/contracts/:id` | One contract with availability + assignment |
+
+Records live in SurrealDB tables `cad_group` (`group_id`, `callsign`,
+`role`, `status`, `members` of `{uid, name}`, `org_id`, `updated_at`)
+and `cad_contract` (`contract_id`, `title`, `type`, `priority`,
+`status`, `locked`, `source`, `position`, `created_at`, `assignment`).
+Contracts are read-only in this slice — they are seeded by the game
+server bridge / mission, as the original's `upsert_catalog_entry` did;
+assign/accept/decline mutations come with the task-lifecycle work.
+Without a database connection the CAD routes answer `503 database
+unavailable` (SurrealDB errors answer `502`); `/health` is unaffected.
+
 ## Roadmap
 
 - [x] Skeleton: health endpoint, SurrealDB connection, `arma://` CORS, Docker
-- [ ] CAD / dispatch endpoints (port of `lib/services` dispatch)
-- [ ] Task / contract endpoints (port of `lib/services` task)
+- [x] CAD: groups, group status, contract availability (+ assigned group)
+- [ ] Task / contract lifecycle: assign / accept / decline, completion
 - [ ] Player data: bank, garages, lockers, phones, orgs, stores
 - [ ] Auth for game servers and web UI clients
 - [ ] Thin the Arma extension down to a bridge (or remove it) once the API owns persistence

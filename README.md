@@ -138,12 +138,177 @@ server bridge / mission, as the original's `upsert_catalog_entry` did.
 Without a database connection the CAD routes answer `503 database
 unavailable` (SurrealDB errors answer `502`); `/health` is unaffected.
 
+## Player data: bank, garages, lockers, phones, orgs, stores
+
+The persistent player state the original extension held in memory:
+bank accounts, garages (stored vehicles + the virtual garage of
+unlocked vehicle classnames), lockers (stored items + the virtual
+locker of unlocked equipment classnames), phones (contacts, messages,
+emails), organizations, and the store checkout that ties them
+together. Grounded in `lib/services/src/bank.rs`, `garage.rs`,
+`locker.rs`, `phone.rs`, `org.rs`, `store.rs`, `v_garage.rs`,
+`v_locker.rs` and the matching models in `lib/models/src/`.
+
+**Auth: these endpoints are unauthenticated for now**, exactly like
+the CAD and lifecycle slices. Auth (player login screen in-game, the
+API issuing a token, player endpoints only answering with a valid
+token) was parked by Jacob as a to-do for later — do not mistake the
+absence of auth here for a decision that it is unnecessary: any caller
+can currently read and mutate any player's bank, garage, locker,
+phone and org data.
+
+- **Bank** (`player_bank`: `uid`, `name`, `bank`, `cash`, `earnings`,
+  `pin`, `transactions`). Money is `f64`, as the original stores it;
+  the PIN is a four-digit number (1000–9999). Deposit moves cash into
+  the bank, withdraw the reverse; earnings deposits move pending
+  earnings into the bank. The original distinguishes the full bank
+  interface (`mode: "bank"`, the web UI) from an ATM session (`mode:
+  "atm"`): deposits/withdrawals from an ATM need `atmAuthorized`,
+  earnings deposits, transfers and PIN changes are bank-interface
+  only, PIN validation is ATM only. `mode` defaults to `"bank"`.
+  Transfers pay from the source's `cash` or `bank` (`fromField`,
+  default `bank`) into the target's `bank`.
+- **Garage** (`player_garage`: `uid`, `vehicles` keyed by plate).
+  At most **5 vehicles**; a stored vehicle's plate is a server-side
+  UUID v4, as the original generates it. `fuel`/`damage` are 0.0–1.0
+  and hit-point arrays (`names`, `selections`, `values`) must match
+  in length with values 0.0–1.0. **Virtual garage**
+  (`player_vgarage`: `uid`, `cars`, `armor`, `helis`, `planes`,
+  `naval`, `other`) holds the unlocked vehicle classnames; adding one
+  that is already unlocked is a no-op.
+- **Locker** (`player_locker`: `uid`, `items` keyed by classname).
+  At most **25 unique items**; storing a classname that is already
+  there overwrites it. Items are `{category, classname, amount}` with
+  `amount >= 1`. **Virtual locker** (`player_vlocker`: `uid`,
+  `items`, `weapons`, `magazines`, `backpacks`) holds the unlocked
+  equipment classnames.
+- **Phone** (`player_phone`: `uid`, `contacts`, `messages`, `emails`).
+  Init seeds contacts with the player themself and the Field
+  Commander (`field_commander`). Messages and emails are indexed on
+  both sides (once for a self-message/email); the Field Commander
+  cannot *receive* player messages or emails but can send them.
+  Message ids are `phone-message:{from}:{to}:{sequence}`, email ids
+  `phone-email:{from}:{to}:{sequence}`; an empty email subject
+  becomes `"No subject"`. Deleting removes only the requesting
+  player's copy.
+- **Orgs** (`org`: `orgId`, `owner`, `name`, `funds`, `reputation`,
+  `creditLines`, `assets`, `fleet`, `members`, `pendingInvites`).
+  Every player starts in the **`default`** org (auto-created on first
+  use, owner `"server"`); registering moves the requester out of it,
+  leaving or disbanding moves members back into it. Treasury actions
+  (invites, credit lines, org-funds charges) are for the org owner,
+  or — for the default/server-owned orgs — a caller flagged
+  `requesterIsDefaultOrgCeo`. Org ids are alphanumeric plus
+  underscores. Credit lines carry the original's 10% default interest
+  rate and are rounded to cents; assigning a line reserves the amount
+  from org funds, repaying splits principal and interest
+  proportionally. Fleet vehicles are keyed `{classname}_{index}` with
+  status `"Ready"`, damage `"0%"`.
+- **Store** (`POST /store/checkout`). The original has **no store
+  catalog and no sell operation**: the caller sends the cart as seeds
+  that already carry their price (`priceValue`), and checkout only
+  buys. Items land in the player's locker and unlock in the virtual
+  locker; vehicles unlock in the virtual garage; units are only
+  *reported* as granted (the original has no unit storage). Payment
+  is `cash` / `bank` / `org_funds` (leader/CEO only; vehicles bought
+  this way also join the org fleet) / `credit_line`. The locker may
+  not grow past 25 unique items. Commit order is locker → virtual
+  locker → virtual garage → org → bank, with the original's
+  best-effort rollback of what was already written on failure.
+
+### Reward hook
+
+After `POST /cad/contracts/{id}/complete` with `succeeded`, the
+bridge reads the contract's `requesterUid` (and `orgId`) and credits
+each participant's pending earnings with `POST
+/players/{uid}/bank/credit-earnings` — mirroring the original's task
+reward service (`fnc_TaskRewardService.sqf`, `applyRatingOutcome`),
+which adds each participant's share of the rating delta to
+`earnings` via a BankStore `mset` patch. The player then moves
+earnings into the bank with `deposit-earnings`. Org reputation is
+adjusted the same way with `POST /orgs/{id}/reputation` (clamped at
+zero).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/players/{uid}/bank` | Create a bank account (`name`, `pin`; 409 if it exists) |
+| `GET` | `/players/{uid}/bank` | One account |
+| `POST` | `/players/{uid}/bank/deposit` | Move cash into the bank (`amount`, `mode`, `atmAuthorized`) |
+| `POST` | `/players/{uid}/bank/withdraw` | Move bank balance into cash |
+| `POST` | `/players/{uid}/bank/deposit-earnings` | Move pending earnings into the bank (bank interface only) |
+| `POST` | `/players/{uid}/bank/credit-earnings` | Credit pending earnings — the contract-reward hook |
+| `POST` | `/players/{uid}/bank/transfer` | Transfer to another player's bank (`targetUid`, `fromField`) |
+| `POST` | `/players/{uid}/bank/validate-pin` | Check a PIN (ATM only; 401 on a wrong PIN) |
+| `POST` | `/players/{uid}/bank/change-pin` | Change a PIN (bank interface only) |
+| `POST` | `/players/{uid}/bank/charge` | Charge cash/bank for a checkout (`sourceField`, `commit`) |
+| `POST` | `/players/{uid}/garage` | Create an empty garage (409 if it exists) |
+| `GET` | `/players/{uid}/garage` | One player's garage |
+| `PUT` | `/players/{uid}/garage` | Replace the whole garage (bulk sync, max 5 vehicles) |
+| `POST` | `/players/{uid}/garage/vehicles` | Store a vehicle (plate is a fresh UUID v4) |
+| `PATCH` | `/players/{uid}/garage/vehicles/{plate}` | Patch damage / fuel / hit points |
+| `DELETE` | `/players/{uid}/garage/vehicles/{plate}` | Remove a stored vehicle |
+| `POST` | `/players/{uid}/vgarage` | Create an empty virtual garage |
+| `GET` | `/players/{uid}/vgarage` | Unlocked vehicle classnames |
+| `GET` | `/players/{uid}/vgarage/{category}` | Unlocked classnames of one category |
+| `POST` | `/players/{uid}/vgarage/{category}` | Unlock classnames |
+| `DELETE` | `/players/{uid}/vgarage/{category}/{classname}` | Remove one unlocked classname |
+| `POST` | `/players/{uid}/locker` | Create an empty locker (409 if it exists) |
+| `GET` | `/players/{uid}/locker` | One player's locker |
+| `PUT` | `/players/{uid}/locker` | Replace the whole locker (bulk sync, max 25 items) |
+| `POST` | `/players/{uid}/locker/items` | Store an item (`category`, `classname`, `amount`) |
+| `PATCH` | `/players/{uid}/locker/items/{classname}` | Change an item's amount |
+| `DELETE` | `/players/{uid}/locker/items/{classname}` | Remove an item |
+| `POST` | `/players/{uid}/vlocker` | Create an empty virtual locker |
+| `GET` | `/players/{uid}/vlocker` | Unlocked equipment classnames |
+| `GET` | `/players/{uid}/vlocker/{category}` | Unlocked classnames of one category |
+| `POST` | `/players/{uid}/vlocker/{category}` | Unlock classnames |
+| `DELETE` | `/players/{uid}/vlocker/{category}/{classname}` | Remove one unlocked classname |
+| `POST` | `/players/{uid}/phone` | Initialize a phone (201 new, 200 existing) |
+| `GET` | `/players/{uid}/phone` | Whole phone payload (contacts, messages, emails) |
+| `POST` | `/players/{uid}/phone/contacts` | Add a contact |
+| `DELETE` | `/players/{uid}/phone/contacts/{contactUid}` | Remove a contact |
+| `GET` | `/players/{uid}/phone/messages` | List messages |
+| `POST` | `/players/{uid}/phone/messages` | Send a message |
+| `GET` | `/players/{uid}/phone/messages/{otherUid}` | Message thread with one player |
+| `POST` | `/players/{uid}/phone/messages/{messageId}/read` | Mark a message read |
+| `DELETE` | `/players/{uid}/phone/messages/{messageId}` | Delete a message (own copy only) |
+| `GET` | `/players/{uid}/phone/emails` | List emails |
+| `POST` | `/players/{uid}/phone/emails` | Send an email |
+| `POST` | `/players/{uid}/phone/emails/{emailId}/read` | Mark an email read |
+| `DELETE` | `/players/{uid}/phone/emails/{emailId}` | Delete an email (own copy only) |
+| `POST` | `/orgs` | Register an org (201; 409 if the id exists) |
+| `GET` | `/orgs/{id}` | One org |
+| `GET` | `/orgs/invites?memberUid=…` | Pending invites of one player, across orgs |
+| `GET` | `/orgs/{id}/members` | Member roster |
+| `POST` | `/orgs/{id}/members` | Ensure a player is on the roster |
+| `DELETE` | `/orgs/{id}/members/{uid}` | Remove a member |
+| `POST` | `/orgs/{id}/invites` | Invite a player (leader/CEO only) |
+| `POST` | `/orgs/{id}/invites/accept` | Accept an invite |
+| `POST` | `/orgs/{id}/invites/decline` | Decline an invite |
+| `POST` | `/orgs/{id}/leave` | Leave an org (owner must disband instead) |
+| `POST` | `/orgs/{id}/disband` | Disband an org (owner only) |
+| `GET` | `/orgs/{id}/assets` | Org assets |
+| `POST` | `/orgs/{id}/assets` | Add assets |
+| `GET` | `/orgs/{id}/fleet` | Org fleet |
+| `POST` | `/orgs/{id}/fleet` | Add fleet vehicles |
+| `POST` | `/orgs/{id}/credit-lines` | Assign a member's credit line (leader/CEO only) |
+| `POST` | `/orgs/{id}/credit-lines/repay` | Repay a member's credit line |
+| `POST` | `/orgs/{id}/charge` | Charge org funds or a credit line |
+| `POST` | `/orgs/{id}/reputation` | Adjust org reputation by a delta (reward hook) |
+| `POST` | `/store/checkout` | Buy a cart (charges + grants; see above) |
+
+Without a database connection the player-data routes answer `503
+database unavailable` (SurrealDB errors answer `502`); `/health` is
+unaffected. Mutations go through the web UI / server bridge as JSON —
+Arma's `webRequest` documents no request-body key, so there is no SQF
+example for them.
+
 ## Roadmap
 
 - [x] Skeleton: health endpoint, SurrealDB connection, `arma://` CORS, Docker
 - [x] CAD: groups, group status, contract availability (+ assigned group)
 - [x] Task / contract lifecycle: assign / accept / decline, completion
-- [ ] Player data: bank, garages, lockers, phones, orgs, stores
+- [x] Player data: bank, garages, lockers, phones, orgs, stores
 - [ ] Auth for game servers and web UI clients
 - [ ] Thin the Arma extension down to a bridge (or remove it) once the API owns persistence
 

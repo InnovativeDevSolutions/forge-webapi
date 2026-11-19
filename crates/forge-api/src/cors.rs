@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use axum::http::{HeaderValue, Method, header};
+use axum::http::{header, HeaderValue, Method};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// Build the CORS layer for the API.

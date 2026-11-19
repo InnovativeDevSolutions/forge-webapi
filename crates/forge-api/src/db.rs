@@ -8,9 +8,9 @@
 
 use std::time::Duration;
 
-use surrealdb::Surreal;
 use surrealdb::engine::remote::http::{Client, Http};
 use surrealdb::opt::auth::Root;
+use surrealdb::Surreal;
 use tokio::time::sleep;
 
 use crate::config::Config;

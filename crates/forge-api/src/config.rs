@@ -43,8 +43,7 @@ impl Config {
                 .unwrap_or_else(|_| "127.0.0.1:8000".to_string()),
             surreal_namespace: env::var("SURREAL_NAMESPACE")
                 .unwrap_or_else(|_| "forge".to_string()),
-            surreal_database: env::var("SURREAL_DATABASE")
-                .unwrap_or_else(|_| "main".to_string()),
+            surreal_database: env::var("SURREAL_DATABASE").unwrap_or_else(|_| "main".to_string()),
             surreal_user: env::var("SURREAL_USER").unwrap_or_else(|_| "root".to_string()),
             surreal_password,
         })

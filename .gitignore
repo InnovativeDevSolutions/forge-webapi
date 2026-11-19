@@ -1,0 +1,11 @@
+# Rust build output
+/target
+
+# Local environment / secrets — never commit
+.env
+
+# Editor and OS noise
+*.log
+.DS_Store
+.idea/
+.vscode/

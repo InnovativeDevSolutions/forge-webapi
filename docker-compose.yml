@@ -1,0 +1,50 @@
+# forge-webapi — one compose file per community.
+#
+# Starts the Forge Web API and its SurrealDB on an isolated internal network.
+# SurrealDB is NOT exposed to the host by default (its port is bound to
+# localhost only, for local debugging); the API is the only public surface.
+#
+# Usage:
+#   cp .env.example .env   # then set a real SURREAL_PASSWORD
+#   docker compose up --build
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v3
+    # Root credentials come from the project .env file (compose interpolates
+    # ${...} from it). There are no default credentials anywhere in this repo.
+    command: start --bind 0.0.0.0:8000 --user "${SURREAL_USER}" --pass "${SURREAL_PASSWORD}" file:/data/forge.db
+    ports:
+      # Localhost only — SurrealDB is an internal service, not a public one.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - surrealdb-data:/data
+    networks:
+      - forge-net
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      SURREAL_ENDPOINT: surrealdb:8000
+      SURREAL_NAMESPACE: "${SURREAL_NAMESPACE:-forge}"
+      SURREAL_DATABASE: "${SURREAL_DATABASE:-main}"
+      SURREAL_USER: "${SURREAL_USER}"
+      SURREAL_PASSWORD: "${SURREAL_PASSWORD}"
+      FORGE_API_BIND: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - surrealdb
+    networks:
+      - forge-net
+
+networks:
+  forge-net:
+    driver: bridge
+
+volumes:
+  surrealdb-data:

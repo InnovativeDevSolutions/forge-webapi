@@ -440,7 +440,7 @@ pub async fn register_group(
         .unwrap_or_else(|| group_id.clone());
 
     let db = db_or_503(&state).await?;
-    let existing: Vec<Group> = select_by_field(&db, GROUP_TABLE, "group_id", &group_id).await?;
+    let existing: Vec<Group> = select_by_field(&db, GROUP_TABLE, "groupId", &group_id).await?;
     let group = Group {
         id: None,
         group_id: group_id.clone(),
@@ -465,8 +465,8 @@ pub async fn register_group(
         let response = db
             .query(
                 "UPDATE cad_group SET callsign = $callsign, role = $role, \
-                 status = $status, members = $members, org_id = $org_id, \
-                 updated_at = $ts WHERE group_id = $id",
+                 status = $status, members = $members, orgId = $orgId, \
+                 updatedAt = $ts WHERE groupId = $id",
             )
             .bind(("callsign", group.callsign.clone()))
             .bind(("role", group.role.as_str().to_string()))
@@ -476,7 +476,7 @@ pub async fn register_group(
                 serde_json::to_value(&group.members).unwrap_or(Value::Null),
             ))
             .bind((
-                "org_id",
+                "orgId",
                 group
                     .org_id
                     .clone()
@@ -497,7 +497,7 @@ pub async fn register_group(
 /// GET /cad/groups/:id — one group.
 pub async fn get_group(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     let db = db_or_503(&state).await?;
-    let groups: Vec<Group> = select_by_field(&db, GROUP_TABLE, "group_id", &id).await?;
+    let groups: Vec<Group> = select_by_field(&db, GROUP_TABLE, "groupId", &id).await?;
     match groups.into_iter().next() {
         Some(group) => Ok((StatusCode::OK, Json(group_json(&group)))),
         None => Err(err(
@@ -528,7 +528,7 @@ pub async fn update_group_status(
 
     let db = db_or_503(&state).await?;
     let mut response = db
-        .query("UPDATE cad_group SET status = $status, updated_at = $ts WHERE group_id = $id")
+        .query("UPDATE cad_group SET status = $status, updatedAt = $ts WHERE groupId = $id")
         .bind(("status", status.as_str().to_string()))
         .bind(("ts", now_unix()))
         .bind(("id", id.clone()))
@@ -832,7 +832,7 @@ pub async fn list_contracts(
 /// assignment.
 pub async fn get_contract(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     let db = db_or_503(&state).await?;
-    let contracts: Vec<Contract> = select_by_field(&db, CONTRACT_TABLE, "contract_id", &id).await?;
+    let contracts: Vec<Contract> = select_by_field(&db, CONTRACT_TABLE, "contractId", &id).await?;
     match contracts.into_iter().next() {
         Some(contract) => Ok((StatusCode::OK, Json(contract_json(&contract)))),
         None => Err(err(
@@ -850,7 +850,7 @@ pub async fn list_group_contracts(
     Path(id): Path<String>,
 ) -> ApiResult {
     let db = db_or_503(&state).await?;
-    let groups: Vec<Group> = select_by_field(&db, GROUP_TABLE, "group_id", &id).await?;
+    let groups: Vec<Group> = select_by_field(&db, GROUP_TABLE, "groupId", &id).await?;
     if groups.is_empty() {
         return Err(err(
             StatusCode::NOT_FOUND,
@@ -945,7 +945,7 @@ fn mutation_json(contract: &Contract, message: &str) -> Value {
 /// Load one contract by its catalog id; 404 when it does not exist.
 async fn load_contract(db: &Db, contract_id: &str) -> Result<Contract, (StatusCode, Json<Value>)> {
     let contracts: Vec<Contract> =
-        select_by_field(db, CONTRACT_TABLE, "contract_id", contract_id).await?;
+        select_by_field(db, CONTRACT_TABLE, "contractId", contract_id).await?;
     contracts.into_iter().next().ok_or_else(|| {
         err(
             StatusCode::NOT_FOUND,
@@ -969,7 +969,7 @@ async fn update_contract_fields(
         .collect::<Vec<_>>()
         .join(", ");
     let mut query = db.query(format!(
-        "UPDATE {CONTRACT_TABLE} SET {set_clause} WHERE contract_id = $id"
+        "UPDATE {CONTRACT_TABLE} SET {set_clause} WHERE contractId = $id"
     ));
     for (field, value) in sets {
         query = query.bind((field, value));
@@ -1115,8 +1115,8 @@ pub async fn accept_contract(
                 serde_json::to_value(&assignment).unwrap_or(Value::Null),
             ),
             ("accepted", Value::Bool(true)),
-            ("requester_uid", Value::String(body.requester_uid.clone())),
-            ("org_id", Value::String(org_id)),
+            ("requesterUid", Value::String(body.requester_uid.clone())),
+            ("orgId", Value::String(org_id)),
         ],
     )
     .await?;
@@ -1174,10 +1174,10 @@ pub async fn decline_contract(
             ("status", Value::String("available".to_string())),
             ("assignment", Value::Null),
             ("accepted", Value::Bool(false)),
-            ("requester_uid", Value::String(String::new())),
-            ("org_id", Value::String("default".to_string())),
+            ("requesterUid", Value::String(String::new())),
+            ("orgId", Value::String("default".to_string())),
             (
-                "last_declined",
+                "lastDeclined",
                 serde_json::to_value(&decline).unwrap_or(Value::Null),
             ),
         ],
@@ -1250,9 +1250,9 @@ pub async fn complete_contract(
         &id,
         vec![
             ("status", Value::String(status.as_str().to_string())),
-            ("completed_at", Value::from(completed_at)),
-            ("completed_by_uid", completed_by_uid),
-            ("completed_by_name", completed_by_name),
+            ("completedAt", Value::from(completed_at)),
+            ("completedByUid", completed_by_uid),
+            ("completedByName", completed_by_name),
         ],
     )
     .await?;

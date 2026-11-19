@@ -76,6 +76,44 @@ Grounded in the original Forge implementation
   `assignedByName`, `assignedAt`, `note`, `accepted`, `acceptedAt`) and
   `assignmentState` (`unassigned` / `assigned` / `accepted` / `active`).
 
+### Contract lifecycle
+
+```
+available ──assign──▶ assigned ──accept──▶ active ──complete──▶ succeeded / failed
+                         │  decline
+                         └──────────▶ available (decline recorded)
+```
+
+- **Assign** (`POST /cad/contracts/:id/assign`, dispatcher): only an
+  `available` contract can be assigned; sets the assignment fields
+  (`groupId`, `groupCallsign`, `assignedByUid`, `assignedByName`,
+  `assignedAt`, `note`) and moves it to `assigned`. Anything else is a
+  `409 Task is not available (status: …)`.
+- **Accept** (`POST /cad/contracts/:id/accept`, group leader): only the
+  assigned group, only while `assigned` or `active`; binds ownership
+  (`requesterUid`, `orgId`, `acceptedAt`) and moves it to `active`.
+  Accepting twice is a `409 Task has already been accepted.`
+- **Decline** (`POST /cad/contracts/:id/decline`, group leader): only the
+  assigned group, only while `assigned` — an accepted (`active`)
+  contract cannot be declined. Clears the assignment, records
+  `lastDeclined` (group, callsign, who, when), and returns the contract
+  to `available`.
+- **Complete** (`POST /cad/contracts/:id/complete`): only `assigned` or
+  `active` contracts, with `{"status": "succeeded"}` or `{"status":
+  "failed"}`; records `completedAt` / `completedByUid` /
+  `completedByName` (the original's completed-status storage). The
+  assignment is kept, and the contract leaves the live board.
+
+Request bodies carry the original's `TaskGroupContext` fields
+(`groupId`, `groupCallsign`, `requesterUid`, `requesterName`, `orgId`,
+`note`, `timestamp` in seconds; `timestamp` 0 means "now"). Mutation
+responses are the updated contract plus a `message` (the original's
+`TaskGroupMutationResult`). State violations answer `409` with the
+original's wording. Mutations go through the dispatcher web UI / server
+bridge as JSON — Arma's `webRequest` documents no request-body key, so
+there is no SQF example for them (see `examples/sqf/webrequest_cad.sqf`
+for the read calls).
+
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/cad/groups` | List groups (`?status=`, `?role=` filters) |
@@ -85,14 +123,18 @@ Grounded in the original Forge implementation
 | `GET` | `/cad/groups/:id/contracts` | Contracts assigned to one group |
 | `GET` | `/cad/contracts` | List contracts (`?available=true/false`, `?status=`, `?group_id=`) |
 | `GET` | `/cad/contracts/:id` | One contract with availability + assignment |
+| `POST` | `/cad/contracts/:id/assign` | Assign an available contract to a group |
+| `POST` | `/cad/contracts/:id/accept` | Assigned group accepts the contract |
+| `POST` | `/cad/contracts/:id/decline` | Assigned group declines; contract back to available |
+| `POST` | `/cad/contracts/:id/complete` | Complete an in-flight contract (`succeeded` / `failed`) |
 
 Records live in SurrealDB tables `cad_group` (`group_id`, `callsign`,
 `role`, `status`, `members` of `{uid, name}`, `org_id`, `updated_at`)
 and `cad_contract` (`contract_id`, `title`, `type`, `priority`,
-`status`, `locked`, `source`, `position`, `created_at`, `assignment`).
-Contracts are read-only in this slice — they are seeded by the game
-server bridge / mission, as the original's `upsert_catalog_entry` did;
-assign/accept/decline mutations come with the task-lifecycle work.
+`status`, `locked`, `source`, `position`, `created_at`, `assignment`,
+`accepted`, `requesterUid`, `orgId`, `lastDeclined`, `completedAt`,
+`completedByUid`, `completedByName`). Contracts are seeded by the game
+server bridge / mission, as the original's `upsert_catalog_entry` did.
 Without a database connection the CAD routes answer `503 database
 unavailable` (SurrealDB errors answer `502`); `/health` is unaffected.
 
@@ -100,7 +142,7 @@ unavailable` (SurrealDB errors answer `502`); `/health` is unaffected.
 
 - [x] Skeleton: health endpoint, SurrealDB connection, `arma://` CORS, Docker
 - [x] CAD: groups, group status, contract availability (+ assigned group)
-- [ ] Task / contract lifecycle: assign / accept / decline, completion
+- [x] Task / contract lifecycle: assign / accept / decline, completion
 - [ ] Player data: bank, garages, lockers, phones, orgs, stores
 - [ ] Auth for game servers and web UI clients
 - [ ] Thin the Arma extension down to a bridge (or remove it) once the API owns persistence

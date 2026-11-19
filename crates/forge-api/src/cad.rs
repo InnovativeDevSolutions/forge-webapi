@@ -41,10 +41,20 @@
 //!   `assignmentState` from that: `assigned` → `assigned`, `active` with a
 //!   group → `accepted`, otherwise `unassigned`. Contract responses here
 //!   expose the same assignment object and `assignmentState`.
-//! - **Lifecycle is read-only in this slice.** Contracts are seeded into
-//!   the `cad_contract` table by the game server bridge / mission (the
-//!   original's `upsert_catalog_entry`); assign/accept/decline mutations
-//!   belong to the later task/contract-lifecycle work, not to CAD scope.
+//! - **Lifecycle mutations** — from `lib/services/src/task.rs`
+//!   (`TaskStateService::assign_group`, `accept_group`, `decline_group`,
+//!   `set_status`) and the extension commands (`assign`, `accept`,
+//!   `decline` in `arma/server/extension/src/task.rs`): assign moves
+//!   `available` → `assigned` and records the assignment; accept (assigned
+//!   group only) binds ownership to the accepting leader and moves
+//!   `assigned` → `active`; decline (assigned only) clears the assignment,
+//!   records the decline, and returns the contract to `available`;
+//!   complete moves an in-flight contract to `succeeded` or `failed` and
+//!   records the completion (the original's completed-status storage).
+//!   State violations are rejected with the original's messages (409).
+//!   Contracts are still seeded into the `cad_contract` table by the game
+//!   server bridge / mission (the original's `upsert_catalog_entry`);
+//!   there is no `POST /cad/contracts` here.
 //!
 //! ## Persistence
 //!
@@ -628,6 +638,19 @@ pub struct ContractAssignment {
     pub accepted_at: Option<f64>,
 }
 
+/// The last decline recorded on a contract — the original's
+/// `lastDeclined*` fields, written by `decline_group`
+/// (`lib/services/src/task.rs`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContractDecline {
+    pub group_id: String,
+    pub group_callsign: String,
+    pub declined_by_uid: String,
+    pub declined_by_name: String,
+    pub declined_at: f64,
+}
+
 /// A CAD contract — one entry of the task catalog (`lib/services/src/task.rs`
 /// `TaskRecord`), as stored in the `cad_contract` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -665,6 +688,30 @@ pub struct Contract {
     /// Assignment state, if the contract is assigned to a group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment: Option<ContractAssignment>,
+    /// Whether the assigned group accepted (original `accepted` catalog
+    /// field, set by `normalize_catalog_entry` in `task.rs`).
+    #[serde(default)]
+    pub accepted: bool,
+    /// UID of the accepting group leader (original `requesterUid`).
+    #[serde(default)]
+    pub requester_uid: String,
+    /// Organization of the accepting leader (original `orgID`).
+    /// `None` until a group accepts or declines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    /// Last decline recorded on this contract, if any (original
+    /// `lastDeclined*` fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_declined: Option<ContractDecline>,
+    /// When the contract was completed, if it has been (the original's
+    /// completed-status storage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<f64>,
+    /// Who completed it, if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_by_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_by_name: Option<String>,
 }
 
 impl Contract {
@@ -826,5 +873,394 @@ pub async fn list_group_contracts(
             "group_id": id,
             "contracts": group_contracts.iter().map(|contract| contract_json(contract)).collect::<Vec<_>>(),
         })),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Contract lifecycle (assign / accept / decline / complete)
+// ---------------------------------------------------------------------------
+
+/// Body for the contract lifecycle mutations — mirrors the original's
+/// `TaskGroupContext` (`lib/models/src/task.rs`): the group the action
+/// concerns, the dispatcher or group leader performing it, their
+/// organization (accept only), an optional note, and an optional
+/// timestamp (Arma time, seconds; 0 means "use the server clock").
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskGroupBody {
+    #[serde(default)]
+    pub group_id: String,
+    #[serde(default)]
+    pub group_callsign: String,
+    #[serde(default)]
+    pub requester_uid: String,
+    #[serde(default)]
+    pub requester_name: String,
+    #[serde(default)]
+    pub org_id: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub timestamp: f64,
+}
+
+/// Body for `POST /cad/contracts/{id}/complete`. The original's
+/// `set_status` takes only the status — the requester fields are carried
+/// so the completion is attributable (stored as `completedByUid` /
+/// `completedByName`); `timestamp` is 0 for "now".
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteContractBody {
+    pub status: String,
+    #[serde(default)]
+    pub requester_uid: String,
+    #[serde(default)]
+    pub requester_name: String,
+    #[serde(default)]
+    pub timestamp: f64,
+}
+
+/// The timestamp a mutation carries. The original stores Arma time
+/// (`TaskGroupContext.timestamp`, seconds, f64); when the caller sends
+/// none (0), use the server clock so `assignedAt` / `acceptedAt` are
+/// always meaningful.
+fn effective_timestamp(provided: f64) -> f64 {
+    if provided > 0.0 {
+        provided
+    } else {
+        now_unix() as f64
+    }
+}
+
+/// A mutation response: the updated contract (with derived availability)
+/// plus the original's result message (`TaskGroupMutationResult.message`).
+fn mutation_json(contract: &Contract, message: &str) -> Value {
+    let mut value = contract_json(contract);
+    if let Value::Object(ref mut map) = value {
+        map.insert("message".to_string(), Value::String(message.to_string()));
+    }
+    value
+}
+
+/// Load one contract by its catalog id; 404 when it does not exist.
+async fn load_contract(db: &Db, contract_id: &str) -> Result<Contract, (StatusCode, Json<Value>)> {
+    let contracts: Vec<Contract> =
+        select_by_field(db, CONTRACT_TABLE, "contract_id", contract_id).await?;
+    contracts.into_iter().next().ok_or_else(|| {
+        err(
+            StatusCode::NOT_FOUND,
+            format!("Contract '{contract_id}' not found."),
+        )
+    })
+}
+
+/// Apply a targeted `UPDATE ... SET` to one contract record and return the
+/// updated record, decoded. Only the listed fields change — the record is
+/// a free-form catalog entry in the original, so a whole-record rewrite
+/// would drop fields the API does not model.
+async fn update_contract_fields(
+    db: &Db,
+    contract_id: &str,
+    sets: Vec<(&'static str, Value)>,
+) -> Result<Contract, (StatusCode, Json<Value>)> {
+    let set_clause = sets
+        .iter()
+        .map(|(field, _)| format!("{field} = ${field}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut query = db.query(format!(
+        "UPDATE {CONTRACT_TABLE} SET {set_clause} WHERE contract_id = $id"
+    ));
+    for (field, value) in sets {
+        query = query.bind((field, value));
+    }
+    let mut response = query
+        .bind(("id", contract_id.to_string()))
+        .await
+        .map_err(|error| db_err("update contract", error))?;
+    let updated: Vec<Value> = response
+        .take(0)
+        .map_err(|error| db_err("update contract", error))?;
+    match updated.into_iter().next() {
+        Some(record) => decode_record(record),
+        None => Err(err(
+            StatusCode::NOT_FOUND,
+            format!("Contract '{contract_id}' not found."),
+        )),
+    }
+}
+
+/// POST /cad/contracts/{id}/assign — assign an `available` contract to a
+/// group (dispatcher action; original `assign_group` in
+/// `lib/services/src/task.rs`). Sets the assignment fields and moves the
+/// contract to `assigned`. Anything that is not `available` is rejected
+/// with the original's message. The group itself is not looked up — the
+/// original does not check it either.
+pub async fn assign_contract(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TaskGroupBody>,
+) -> ApiResult {
+    let group_id = body.group_id.trim().to_string();
+    if group_id.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Group ID is required."));
+    }
+
+    let db = db_or_503(&state).await?;
+    let contract = load_contract(&db, &id).await?;
+    if contract.status != ContractStatus::Available {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!(
+                "Task is not available (status: {}).",
+                contract.status.as_str()
+            ),
+        ));
+    }
+
+    // Callsign falls back to the group id, exactly as in the original.
+    let callsign = if body.group_callsign.trim().is_empty() {
+        group_id.clone()
+    } else {
+        body.group_callsign.clone()
+    };
+    let assignment = ContractAssignment {
+        group_id: group_id.clone(),
+        group_callsign: callsign.clone(),
+        assigned_by_uid: body.requester_uid.clone(),
+        assigned_by_name: body.requester_name.clone(),
+        assigned_at: effective_timestamp(body.timestamp),
+        note: body.note.clone(),
+        accepted: false,
+        accepted_at: None,
+    };
+    let updated = update_contract_fields(
+        &db,
+        &id,
+        vec![
+            ("status", Value::String("assigned".to_string())),
+            (
+                "assignment",
+                serde_json::to_value(&assignment).unwrap_or(Value::Null),
+            ),
+        ],
+    )
+    .await?;
+    Ok((
+        StatusCode::OK,
+        Json(mutation_json(
+            &updated,
+            &format!("Task assigned to {callsign}."),
+        )),
+    ))
+}
+
+/// POST /cad/contracts/{id}/accept — the assigned group accepts its
+/// contract (original `accept_group`). Binds ownership to the accepting
+/// leader (requester UID + org, default `default`) and moves the contract
+/// from `assigned` to `active`.
+///
+/// Two original flows meet here: the group flow (`accept_group`) only
+/// accepts while `assigned`, while the older ownership flow (`accept_task`)
+/// also allows `active` — so an already `active` contract that has not
+/// been accepted yet can still be accepted here. An already accepted one
+/// is rejected with the original's "Task has already been accepted."
+pub async fn accept_contract(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TaskGroupBody>,
+) -> ApiResult {
+    if body.requester_uid.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Requester UID is required."));
+    }
+
+    let db = db_or_503(&state).await?;
+    let contract = load_contract(&db, &id).await?;
+    if !matches!(
+        contract.status,
+        ContractStatus::Assigned | ContractStatus::Active
+    ) {
+        return Err(err(StatusCode::CONFLICT, "Task is not assigned or active."));
+    }
+    let Some(mut assignment) = contract.assignment.clone() else {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "Task is not assigned to this group.",
+        ));
+    };
+    if body.group_id.trim().is_empty() || assignment.group_id != body.group_id {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "Task is not assigned to this group.",
+        ));
+    }
+    if contract.status == ContractStatus::Active && assignment.accepted {
+        return Err(err(StatusCode::CONFLICT, "Task has already been accepted."));
+    }
+
+    let org_id = if body.org_id.trim().is_empty() {
+        "default".to_string()
+    } else {
+        body.org_id.clone()
+    };
+    assignment.accepted = true;
+    assignment.accepted_at = Some(effective_timestamp(body.timestamp));
+    let updated = update_contract_fields(
+        &db,
+        &id,
+        vec![
+            ("status", Value::String("active".to_string())),
+            (
+                "assignment",
+                serde_json::to_value(&assignment).unwrap_or(Value::Null),
+            ),
+            ("accepted", Value::Bool(true)),
+            ("requester_uid", Value::String(body.requester_uid.clone())),
+            ("org_id", Value::String(org_id)),
+        ],
+    )
+    .await?;
+    Ok((
+        StatusCode::OK,
+        Json(mutation_json(&updated, "Task accepted.")),
+    ))
+}
+
+/// POST /cad/contracts/{id}/decline — the assigned group declines its
+/// contract (original `decline_group`). Only allowed while `assigned`;
+/// an accepted (`active`) contract cannot be declined. The assignment is
+/// cleared, the decline is recorded, and the contract returns to
+/// `available`.
+pub async fn decline_contract(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TaskGroupBody>,
+) -> ApiResult {
+    let db = db_or_503(&state).await?;
+    let contract = load_contract(&db, &id).await?;
+    if contract.status != ContractStatus::Assigned {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!(
+                "Task is not awaiting acceptance (status: {}).",
+                contract.status.as_str()
+            ),
+        ));
+    }
+    let Some(assignment) = contract.assignment.as_ref() else {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "Task is not assigned to this group.",
+        ));
+    };
+    if body.group_id.trim().is_empty() || assignment.group_id != body.group_id {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "Task is not assigned to this group.",
+        ));
+    }
+    let callsign = assignment.group_callsign.clone();
+    let decline = ContractDecline {
+        group_id: body.group_id.clone(),
+        group_callsign: callsign.clone(),
+        declined_by_uid: body.requester_uid.clone(),
+        declined_by_name: body.requester_name.clone(),
+        declined_at: effective_timestamp(body.timestamp),
+    };
+    let updated = update_contract_fields(
+        &db,
+        &id,
+        vec![
+            ("status", Value::String("available".to_string())),
+            ("assignment", Value::Null),
+            ("accepted", Value::Bool(false)),
+            ("requester_uid", Value::String(String::new())),
+            ("org_id", Value::String("default".to_string())),
+            (
+                "last_declined",
+                serde_json::to_value(&decline).unwrap_or(Value::Null),
+            ),
+        ],
+    )
+    .await?;
+    Ok((
+        StatusCode::OK,
+        Json(mutation_json(
+            &updated,
+            &format!("{callsign} declined the task. It is back on the board."),
+        )),
+    ))
+}
+
+/// POST /cad/contracts/{id}/complete — finish an in-flight contract
+/// (original `set_status` with `succeeded` / `failed`, which also records
+/// the outcome in completed-status storage). Only `assigned` or `active`
+/// contracts can be completed — the original's `set_status` itself takes
+/// any non-empty status with no state guard, so this guard is the API's
+/// choice, following the lifecycle: a contract must be in flight to be
+/// completed. The assignment is kept, and the contract leaves the live
+/// board.
+pub async fn complete_contract(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<CompleteContractBody>,
+) -> ApiResult {
+    let status = match body.status.as_str() {
+        "succeeded" => ContractStatus::Succeeded,
+        "failed" => ContractStatus::Failed,
+        _ => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid completion status '{}'. Valid statuses: succeeded, failed.",
+                    body.status
+                ),
+            ));
+        }
+    };
+
+    let db = db_or_503(&state).await?;
+    let contract = load_contract(&db, &id).await?;
+    if !matches!(
+        contract.status,
+        ContractStatus::Assigned | ContractStatus::Active
+    ) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!(
+                "Task cannot be completed (status: {}). Only assigned or active contracts can be completed.",
+                contract.status.as_str()
+            ),
+        ));
+    }
+
+    let completed_at = effective_timestamp(body.timestamp);
+    let completed_by_uid = if body.requester_uid.trim().is_empty() {
+        Value::Null
+    } else {
+        Value::String(body.requester_uid.clone())
+    };
+    let completed_by_name = if body.requester_name.trim().is_empty() {
+        Value::Null
+    } else {
+        Value::String(body.requester_name.clone())
+    };
+    let updated = update_contract_fields(
+        &db,
+        &id,
+        vec![
+            ("status", Value::String(status.as_str().to_string())),
+            ("completed_at", Value::from(completed_at)),
+            ("completed_by_uid", completed_by_uid),
+            ("completed_by_name", completed_by_name),
+        ],
+    )
+    .await?;
+    Ok((
+        StatusCode::OK,
+        Json(mutation_json(
+            &updated,
+            &format!("Task completed ({}).", status.as_str()),
+        )),
     ))
 }

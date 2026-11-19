@@ -13,7 +13,7 @@ mod routes;
 use std::sync::Arc;
 
 use axum::{
-    routing::{get, put},
+    routing::{get, post, put},
     Router,
 };
 use tower_http::trace::TraceLayer;
@@ -75,6 +75,10 @@ async fn main() -> Result<(), String> {
         .route("/cad/groups/{id}/contracts", get(cad::list_group_contracts))
         .route("/cad/contracts", get(cad::list_contracts))
         .route("/cad/contracts/{id}", get(cad::get_contract))
+        .route("/cad/contracts/{id}/assign", post(cad::assign_contract))
+        .route("/cad/contracts/{id}/accept", post(cad::accept_contract))
+        .route("/cad/contracts/{id}/decline", post(cad::decline_contract))
+        .route("/cad/contracts/{id}/complete", post(cad::complete_contract))
         .layer(cors::arma_cors_layer())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

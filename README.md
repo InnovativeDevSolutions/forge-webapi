@@ -16,7 +16,7 @@ Arma 3 server(s) ──webRequest──▶ forge-api (Rust, axum) ──▶ Surr
 ```
 
 - **forge-api** — Rust API (`crates/forge-api`). Stateless; all durable state lives in SurrealDB.
-- **SurrealDB** — the persistence store (namespace `forge`, database `main` by default). It is not exposed to the network — its port is bound to localhost only, for local debugging.
+- **SurrealDB** — the persistence store (namespace `forge`, database `main` by default). It is not exposed to the network — its port is bound to localhost only, for local debugging. On startup the API defines its tables (`DEFINE TABLE IF NOT EXISTS ... SCHEMALESS`, see `crates/forge-api/src/db.rs`), so a fresh database works on first boot with no manual migration step; the step is idempotent and leaves existing data alone.
 - **Web UI** — the existing Forge browser UIs (banking, garages, CAD, …) will talk to this API instead of the extension. Not yet wired up.
 
 Each community runs its own stack — there is no shared hosted API.

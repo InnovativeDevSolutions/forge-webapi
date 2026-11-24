@@ -13,6 +13,10 @@ services:
     # Pinned: the floating `v3` tag pulled 3.3.5, which removed the `file://`
     # datastore scheme (server exits at startup). SurrealKV is its replacement.
     image: surrealdb/surrealdb:v3.3.5
+    # The 3.3.5 image runs as user `nonroot`, but the named volume is
+    # root-owned, so SurrealKV gets "Permission denied" writing /data.
+    # Running as root fixes that; the data still lives in the volume.
+    user: root
     # Root credentials come from the project .env file (compose interpolates
     # ${...} from it). There are no default credentials anywhere in this repo.
     command: start --bind 0.0.0.0:8000 --user "${SURREAL_USER}" --pass "${SURREAL_PASSWORD}" surrealkv:///data/forge.db

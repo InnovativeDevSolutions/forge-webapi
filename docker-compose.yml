@@ -10,10 +10,12 @@
 
 services:
   surrealdb:
-    image: surrealdb/surrealdb:v3
+    # Pinned: the floating `v3` tag pulled 3.3.5, which removed the `file://`
+    # datastore scheme (server exits at startup). SurrealKV is its replacement.
+    image: surrealdb/surrealdb:v3.3.5
     # Root credentials come from the project .env file (compose interpolates
     # ${...} from it). There are no default credentials anywhere in this repo.
-    command: start --bind 0.0.0.0:8000 --user "${SURREAL_USER}" --pass "${SURREAL_PASSWORD}" file:/data/forge.db
+    command: start --bind 0.0.0.0:8000 --user "${SURREAL_USER}" --pass "${SURREAL_PASSWORD}" surrealkv:///data/forge.db
     ports:
       # Localhost only — SurrealDB is an internal service, not a public one.
       - "127.0.0.1:8000:8000"

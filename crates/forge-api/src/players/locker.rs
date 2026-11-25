@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    create_record, db_or_503, err, load_by_field, select_by_field, to_content,
+    create_record, db_or_503, delete_by_field, err, load_by_field, select_by_field, to_content,
     update_record_content, ApiResult,
 };
 use crate::AppState;
@@ -187,6 +187,19 @@ pub async fn replace_locker(
     locker.items = body.items;
     let saved = save_locker(&db, &locker).await?;
     Ok((StatusCode::OK, Json(json!(saved))))
+}
+
+/// DELETE /players/{uid}/locker — remove a whole locker (original
+/// `LockerService::delete`). 404 when the player has no locker.
+pub async fn delete_locker(State(state): State<AppState>, Path(uid): Path<String>) -> ApiResult {
+    let db = db_or_503(&state).await?;
+    if !delete_by_field(&db, LOCKER_TABLE, "uid", &uid).await? {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("Locker for '{uid}' not found."),
+        ));
+    }
+    Ok((StatusCode::OK, Json(json!({ "deleted": true }))))
 }
 
 /// POST /players/{uid}/locker/items — store an item (original
@@ -441,6 +454,19 @@ pub async fn add_vlocker_classnames(
     }
     let saved = save_vlocker(&db, &vlocker).await?;
     Ok((StatusCode::OK, Json(json!(saved))))
+}
+
+/// DELETE /players/{uid}/vlocker — remove a whole virtual locker
+/// (original `VLockerService::delete`). 404 when the player has none.
+pub async fn delete_vlocker(State(state): State<AppState>, Path(uid): Path<String>) -> ApiResult {
+    let db = db_or_503(&state).await?;
+    if !delete_by_field(&db, VLOCKER_TABLE, "uid", &uid).await? {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("Virtual locker for '{uid}' not found."),
+        ));
+    }
+    Ok((StatusCode::OK, Json(json!({ "deleted": true }))))
 }
 
 /// DELETE /players/{uid}/vlocker/{category}/{classname} — remove one

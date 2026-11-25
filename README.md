@@ -122,6 +122,7 @@ for the read calls).
 | `PUT` | `/cad/groups/:id/status` | Update a group's status (`{"status": "en_route"}`) |
 | `GET` | `/cad/groups/:id/contracts` | Contracts assigned to one group |
 | `GET` | `/cad/contracts` | List contracts (`?available=true/false`, `?status=`, `?group_id=`) |
+| `POST` | `/cad/contracts` | Seed one contract into the catalog (409 if the id exists) |
 | `GET` | `/cad/contracts/:id` | One contract with availability + assignment |
 | `POST` | `/cad/contracts/:id/assign` | Assign an available contract to a group |
 | `POST` | `/cad/contracts/:id/accept` | Assigned group accepts the contract |
@@ -161,7 +162,8 @@ phone and org data.
   `pin`, `transactions`). Money is `f64`, as the original stores it;
   the PIN is a four-digit number (1000–9999). Deposit moves cash into
   the bank, withdraw the reverse; earnings deposits move pending
-  earnings into the bank. The original distinguishes the full bank
+  earnings into the bank. `PUT /players/{uid}/bank` replaces the whole
+  account (the hot-state save); `DELETE` removes it. The original distinguishes the full bank
   interface (`mode: "bank"`, the web UI) from an ATM session (`mode:
   "atm"`): deposits/withdrawals from an ATM need `atmAuthorized`,
   earnings deposits, transfers and PIN changes are bank-interface
@@ -190,7 +192,16 @@ phone and org data.
   Message ids are `phone-message:{from}:{to}:{sequence}`, email ids
   `phone-email:{from}:{to}:{sequence}`; an empty email subject
   becomes `"No subject"`. Deleting removes only the requesting
-  player's copy.
+  player's copy. Sends accept a client-supplied `id` (the extension
+  pre-assigns ids) and are idempotent per phone — sending the same id
+  twice does not duplicate it. `PUT /players/{uid}/phone` replaces
+  the whole payload (the bridge's migration seed); `DELETE` removes it.
+- **Actor** (`player_actor`: `uid`, `name`, `loadout`, `position`,
+  `direction`, `stance`, `email`, `phoneNumber`, `state`, `holster`,
+  `rank`, `organization`). A separate table from the legacy `actor`
+  table on purpose: the legacy record is snake_case (`phone_number`)
+  and sharing the table would drop the phone number on read. UIDs are
+  numeric, 12–17 digits (the relaxed single-player rule).
 - **Orgs** (`org`: `orgId`, `owner`, `name`, `funds`, `reputation`,
   `creditLines`, `assets`, `fleet`, `members`, `pendingInvites`).
   Every player starts in the **`default`** org (auto-created on first
@@ -233,6 +244,8 @@ zero).
 |---|---|---|
 | `POST` | `/players/{uid}/bank` | Create a bank account (`name`, `pin`; 409 if it exists) |
 | `GET` | `/players/{uid}/bank` | One account |
+| `PUT` | `/players/{uid}/bank` | Replace the whole account (hot-state save; creates if missing) |
+| `DELETE` | `/players/{uid}/bank` | Remove an account |
 | `POST` | `/players/{uid}/bank/deposit` | Move cash into the bank (`amount`, `mode`, `atmAuthorized`) |
 | `POST` | `/players/{uid}/bank/withdraw` | Move bank balance into cash |
 | `POST` | `/players/{uid}/bank/deposit-earnings` | Move pending earnings into the bank (bank interface only) |
@@ -244,40 +257,52 @@ zero).
 | `POST` | `/players/{uid}/garage` | Create an empty garage (409 if it exists) |
 | `GET` | `/players/{uid}/garage` | One player's garage |
 | `PUT` | `/players/{uid}/garage` | Replace the whole garage (bulk sync, max 5 vehicles) |
+| `DELETE` | `/players/{uid}/garage` | Remove a whole garage |
 | `POST` | `/players/{uid}/garage/vehicles` | Store a vehicle (plate is a fresh UUID v4) |
 | `PATCH` | `/players/{uid}/garage/vehicles/{plate}` | Patch damage / fuel / hit points |
 | `DELETE` | `/players/{uid}/garage/vehicles/{plate}` | Remove a stored vehicle |
 | `POST` | `/players/{uid}/vgarage` | Create an empty virtual garage |
 | `GET` | `/players/{uid}/vgarage` | Unlocked vehicle classnames |
+| `DELETE` | `/players/{uid}/vgarage` | Remove a whole virtual garage |
 | `GET` | `/players/{uid}/vgarage/{category}` | Unlocked classnames of one category |
 | `POST` | `/players/{uid}/vgarage/{category}` | Unlock classnames |
 | `DELETE` | `/players/{uid}/vgarage/{category}/{classname}` | Remove one unlocked classname |
 | `POST` | `/players/{uid}/locker` | Create an empty locker (409 if it exists) |
 | `GET` | `/players/{uid}/locker` | One player's locker |
 | `PUT` | `/players/{uid}/locker` | Replace the whole locker (bulk sync, max 25 items) |
+| `DELETE` | `/players/{uid}/locker` | Remove a whole locker |
 | `POST` | `/players/{uid}/locker/items` | Store an item (`category`, `classname`, `amount`) |
 | `PATCH` | `/players/{uid}/locker/items/{classname}` | Change an item's amount |
 | `DELETE` | `/players/{uid}/locker/items/{classname}` | Remove an item |
 | `POST` | `/players/{uid}/vlocker` | Create an empty virtual locker |
 | `GET` | `/players/{uid}/vlocker` | Unlocked equipment classnames |
+| `DELETE` | `/players/{uid}/vlocker` | Remove a whole virtual locker |
 | `GET` | `/players/{uid}/vlocker/{category}` | Unlocked classnames of one category |
 | `POST` | `/players/{uid}/vlocker/{category}` | Unlock classnames |
 | `DELETE` | `/players/{uid}/vlocker/{category}/{classname}` | Remove one unlocked classname |
 | `POST` | `/players/{uid}/phone` | Initialize a phone (201 new, 200 existing) |
 | `GET` | `/players/{uid}/phone` | Whole phone payload (contacts, messages, emails) |
+| `PUT` | `/players/{uid}/phone` | Replace the whole payload (bridge migration seed) |
+| `DELETE` | `/players/{uid}/phone` | Remove a whole phone |
 | `POST` | `/players/{uid}/phone/contacts` | Add a contact |
 | `DELETE` | `/players/{uid}/phone/contacts/{contactUid}` | Remove a contact |
 | `GET` | `/players/{uid}/phone/messages` | List messages |
-| `POST` | `/players/{uid}/phone/messages` | Send a message |
+| `POST` | `/players/{uid}/phone/messages` | Send a message (optional client-supplied `id`; idempotent per phone) |
 | `GET` | `/players/{uid}/phone/messages/{otherUid}` | Message thread with one player |
 | `POST` | `/players/{uid}/phone/messages/{messageId}/read` | Mark a message read |
 | `DELETE` | `/players/{uid}/phone/messages/{messageId}` | Delete a message (own copy only) |
 | `GET` | `/players/{uid}/phone/emails` | List emails |
-| `POST` | `/players/{uid}/phone/emails` | Send an email |
+| `POST` | `/players/{uid}/phone/emails` | Send an email (optional client-supplied `id`; idempotent per phone) |
 | `POST` | `/players/{uid}/phone/emails/{emailId}/read` | Mark an email read |
 | `DELETE` | `/players/{uid}/phone/emails/{emailId}` | Delete an email (own copy only) |
+| `POST` | `/players/{uid}/actor` | Create an actor (409 if it exists) |
+| `GET` | `/players/{uid}/actor` | One player's actor |
+| `PUT` | `/players/{uid}/actor` | Replace the whole actor (hot-state save; creates if missing) |
+| `DELETE` | `/players/{uid}/actor` | Remove an actor |
 | `POST` | `/orgs` | Register an org (201; 409 if the id exists) |
 | `GET` | `/orgs/{id}` | One org |
+| `PUT` | `/orgs/{id}` | Replace the whole org record (hot-state save; creates if missing) |
+| `DELETE` | `/orgs/{id}` | Remove an org record (members must be moved first, as disband does) |
 | `GET` | `/orgs/invites?memberUid=…` | Pending invites of one player, across orgs |
 | `GET` | `/orgs/{id}/members` | Member roster |
 | `POST` | `/orgs/{id}/members` | Ensure a player is on the roster |

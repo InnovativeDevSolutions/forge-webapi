@@ -51,7 +51,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    create_record, db_or_503, err, load_by_field, to_content, update_record_content, ApiResult,
+    create_record, db_or_503, delete_by_field, err, load_by_field, to_content,
+    update_record_content, ApiResult,
 };
 use crate::AppState;
 
@@ -297,6 +298,59 @@ pub async fn get_bank(State(state): State<AppState>, Path(uid): Path<String>) ->
     let db = db_or_503(&state).await?;
     let bank = load_bank(&db, &uid).await?;
     Ok((StatusCode::OK, Json(json!(bank))))
+}
+
+/// PUT /players/{uid}/bank — replace the whole account (original
+/// `BankHotStateService` save: the hot state persists a whole `Bank`
+/// record, balances and transaction log included). Creates the account
+/// when it does not exist yet, so the hot-state save path never 404s.
+/// The `uid` in the body must match the path.
+pub async fn replace_bank(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    Json(body): Json<Bank>,
+) -> ApiResult {
+    let uid = uid.trim().to_string();
+    if uid.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "UID cannot be empty"));
+    }
+    if body.uid.trim() != uid {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Bank UID '{}' does not match the path UID '{uid}'.",
+                body.uid
+            ),
+        ));
+    }
+    body.validate().map_err(|error| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("Validation failed: {error}"),
+        )
+    })?;
+
+    let db = db_or_503(&state).await?;
+    let existing: Vec<Bank> = super::select_by_field(&db, BANK_TABLE, "uid", &uid).await?;
+    if existing.is_empty() {
+        let created = create_record(&db, BANK_TABLE, &body).await?;
+        return Ok((StatusCode::OK, Json(json!(created))));
+    }
+    let saved = save_bank(&db, &body).await?;
+    Ok((StatusCode::OK, Json(json!(saved))))
+}
+
+/// DELETE /players/{uid}/bank — remove an account (original
+/// `BankService::delete`). 404 when the player has no account.
+pub async fn delete_bank(State(state): State<AppState>, Path(uid): Path<String>) -> ApiResult {
+    let db = db_or_503(&state).await?;
+    if !delete_by_field(&db, BANK_TABLE, "uid", &uid).await? {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("Bank with uid '{uid}' not found."),
+        ));
+    }
+    Ok((StatusCode::OK, Json(json!({ "deleted": true }))))
 }
 
 /// POST /players/{uid}/bank/deposit — move cash into the bank

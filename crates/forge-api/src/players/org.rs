@@ -58,8 +58,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    create_record, db_or_503, err, load_by_field, round_currency, select_all, select_by_field,
-    to_content, update_record_content, ApiResult,
+    create_record, db_or_503, delete_by_field, err, load_by_field, round_currency, select_all,
+    select_by_field, to_content, update_record_content, ApiResult,
 };
 use crate::AppState;
 
@@ -632,6 +632,88 @@ pub async fn get_org(State(state): State<AppState>, Path(id): Path<String>) -> A
     let db = db_or_503(&state).await?;
     let org = load_org(&db, &id).await?;
     Ok((StatusCode::OK, Json(json!(org))))
+}
+
+/// PUT /orgs/{id} — replace the whole organization record (original
+/// `OrgHotStateService::save_org`: the hot state persists a whole
+/// `HotOrgRecord` — core, credit lines, assets, fleet, members,
+/// pending invites). Creates the record when it does not exist yet.
+///
+/// Replace semantics: the record stored is exactly the body supplied.
+/// The extension's partial updates (`update`, `update_assets`,
+/// `update_fleet`) read the current record first and PUT the merged
+/// whole back, so a collection the caller did not intend to replace
+/// survives; only a caller that sends an empty collection clears it.
+/// The API's own `add_assets` / `add_fleet_vehicles` stay add-only.
+///
+/// Legacy shape: the extension used to write org records with
+/// snake_case `org_id`, which this `OrgRecord` (camelCase `orgId`)
+/// cannot decode. The PUT deletes any such legacy-shaped record for
+/// this org first, converging the table to the one camelCase record —
+/// so a legacy org migrated through this endpoint never leaves a
+/// duplicate behind.
+pub async fn replace_org(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(mut body): Json<OrgRecord>,
+) -> ApiResult {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Organization ID cannot be empty",
+        ));
+    }
+    if body.org_id.trim() != id {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Organization ID '{}' does not match the path ID '{id}'.",
+                body.org_id
+            ),
+        ));
+    }
+    body.funds = round_currency(body.funds);
+    for credit_line in body.credit_lines.values_mut() {
+        credit_line.normalize();
+    }
+    body.validate().map_err(|error| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("Validation failed: {error}"),
+        )
+    })?;
+
+    let db = db_or_503(&state).await?;
+    // Drop any legacy-shaped record for this org (see the doc above);
+    // it can never be decoded as an OrgRecord, so it must go before
+    // the upsert rather than linger as a duplicate.
+    let _ = delete_by_field(&db, ORG_TABLE, "org_id", &id).await?;
+    let existing: Vec<OrgRecord> = select_by_field(&db, ORG_TABLE, "orgId", &id).await?;
+    if existing.is_empty() {
+        let created = create_record(&db, ORG_TABLE, &body).await?;
+        return Ok((StatusCode::OK, Json(json!(created))));
+    }
+    let saved = save_org(&db, &body).await?;
+    Ok((StatusCode::OK, Json(json!(saved))))
+}
+
+/// DELETE /orgs/{id} — remove an organization record (original
+/// `OrgService::delete_org` / repository `delete`). A plain record
+/// delete: the caller moves members first, exactly as the disband
+/// flow does — this endpoint does not migrate anyone. 404 when no
+/// record (current or legacy-shaped) exists for the id.
+pub async fn delete_org(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    let db = db_or_503(&state).await?;
+    let deleted = delete_by_field(&db, ORG_TABLE, "orgId", &id).await?;
+    let deleted_legacy = delete_by_field(&db, ORG_TABLE, "org_id", &id).await?;
+    if !deleted && !deleted_legacy {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("Organization '{id}' not found."),
+        ));
+    }
+    Ok((StatusCode::OK, Json(json!({ "deleted": true }))))
 }
 
 /// GET /orgs/invites?memberUid=… — the pending invites of one player

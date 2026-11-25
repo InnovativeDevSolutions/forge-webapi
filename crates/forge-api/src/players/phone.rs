@@ -39,8 +39,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    create_record, db_or_503, err, load_by_field, now_unix_f64, select_by_field, to_content,
-    update_record_content, ApiResult,
+    create_record, db_or_503, delete_by_field, err, load_by_field, now_unix_f64, select_by_field,
+    to_content, update_record_content, ApiResult,
 };
 use crate::AppState;
 
@@ -121,6 +121,12 @@ pub struct SendMessageBody {
     pub message: String,
     #[serde(default)]
     pub timestamp: Option<f64>,
+    /// Client-supplied id (`phone-message:{from}:{to}:{sequence}`).
+    /// The extension's phone service pre-assigns ids from its
+    /// repository sequence, so the bridge sends the id it already
+    /// holds; when omitted the API generates one as before.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// Body for `POST /players/{uid}/phone/emails`.
@@ -132,6 +138,10 @@ pub struct SendEmailBody {
     pub body: String,
     #[serde(default)]
     pub timestamp: Option<f64>,
+    /// Client-supplied id (`phone-email:{from}:{to}:{sequence}`),
+    /// same rule as messages.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 fn validate_uid(uid: &str) -> Result<String, (StatusCode, Json<Value>)> {
@@ -220,6 +230,70 @@ pub async fn get_phone(State(state): State<AppState>, Path(uid): Path<String>) -
     Ok((StatusCode::OK, Json(json!(phone))))
 }
 
+/// PUT /players/{uid}/phone — replace the whole payload (contacts,
+/// messages, emails). There is no hot-state save for phones in the
+/// original — one `PhoneStateService` over the repository — so this
+/// exists for the bridge's one-time migration: the legacy phone is
+/// read whole (contacts, messages with their ids and read flags,
+/// emails) and written here exactly once. Creates the record when it
+/// does not exist yet. Every message and email must carry a non-empty
+/// id, since ids address individual messages.
+pub async fn replace_phone(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    Json(body): Json<PhonePayload>,
+) -> ApiResult {
+    let uid = validate_uid(&uid)?;
+    if body.uid.trim() != uid {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Phone UID '{}' does not match the path UID '{uid}'.",
+                body.uid
+            ),
+        ));
+    }
+    for message in &body.messages {
+        if message.id.trim().is_empty() {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "Every message must have a non-empty id.",
+            ));
+        }
+    }
+    for email in &body.emails {
+        if email.id.trim().is_empty() {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "Every email must have a non-empty id.",
+            ));
+        }
+    }
+
+    let db = db_or_503(&state).await?;
+    let existing: Vec<PhonePayload> = select_by_field(&db, PHONE_TABLE, "uid", &uid).await?;
+    if existing.is_empty() {
+        let created = create_record(&db, PHONE_TABLE, &body).await?;
+        return Ok((StatusCode::OK, Json(json!(created))));
+    }
+    let saved = save_phone(&db, &body).await?;
+    Ok((StatusCode::OK, Json(json!(saved))))
+}
+
+/// DELETE /players/{uid}/phone — remove a whole phone (original
+/// `PhoneStateService::remove_phone`). 404 when the player has no
+/// phone.
+pub async fn delete_phone(State(state): State<AppState>, Path(uid): Path<String>) -> ApiResult {
+    let db = db_or_503(&state).await?;
+    if !delete_by_field(&db, PHONE_TABLE, "uid", &uid).await? {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("Phone '{uid}' not found."),
+        ));
+    }
+    Ok((StatusCode::OK, Json(json!({ "deleted": true }))))
+}
+
 /// POST /players/{uid}/phone/contacts — add a contact (original
 /// `add_contact`). A player may add themself (the original's
 /// `contact_can_reference_self_for_owner_card` test).
@@ -287,6 +361,14 @@ pub async fn list_messages(State(state): State<AppState>, Path(uid): Path<String
 /// `send_message`). The message is indexed on both the sender's and the
 /// receiver's phones (once for a self-message). The Field Commander
 /// cannot receive player messages.
+///
+/// The id is the caller's when one is supplied (the extension's phone
+/// service pre-assigns it), otherwise generated as before. Appending
+/// is idempotent per phone: a message with the same id is not added
+/// twice — the bridge calls this once per side with the same record,
+/// so the second call is a no-op. The sender's copy is marked read,
+/// matching the original's per-side index (`is_read = from == uid`)
+/// and the email path below.
 pub async fn send_message(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -297,19 +379,32 @@ pub async fn send_message(
     let message = validate_non_empty(&body.message, "Message body is required.")?;
     validate_send_target(&from_uid, &to_uid, "messages")?;
     let timestamp = body.timestamp.unwrap_or_else(now_unix_f64);
+    let id = match body.id.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => sequence_id("phone-message", &from_uid, &to_uid),
+    };
 
     let db = db_or_503(&state).await?;
+    let mut sender = load_phone(&db, &from_uid).await?;
+    if !sender.messages.iter().any(|m| m.id == id) {
+        sender.messages.push(PhoneMessage {
+            id: id.clone(),
+            from: from_uid.clone(),
+            to: to_uid.clone(),
+            message: message.clone(),
+            timestamp,
+            read: true,
+        });
+        save_phone(&db, &sender).await?;
+    }
     let record = PhoneMessage {
-        id: sequence_id("phone-message", &from_uid, &to_uid),
+        id: id.clone(),
         from: from_uid.clone(),
         to: to_uid.clone(),
         message,
         timestamp,
         read: false,
     };
-    let mut sender = load_phone(&db, &from_uid).await?;
-    sender.messages.push(record.clone());
-    save_phone(&db, &sender).await?;
     if to_uid != from_uid {
         // The receiver may not have a phone yet — the original's
         // repository appends regardless; here a missing receiver phone
@@ -327,8 +422,10 @@ pub async fn send_message(
                 create_record(&db, PHONE_TABLE, &phone).await?
             }
         };
-        receiver.messages.push(record.clone());
-        save_phone(&db, &receiver).await?;
+        if !receiver.messages.iter().any(|m| m.id == id) {
+            receiver.messages.push(record.clone());
+            save_phone(&db, &receiver).await?;
+        }
     }
     Ok((StatusCode::CREATED, Json(json!(record))))
 }
@@ -424,7 +521,8 @@ pub async fn list_emails(State(state): State<AppState>, Path(uid): Path<String>)
 /// `send_email`). Appended to the receiver's list and to the sender's
 /// list marked read (unless it is a self-email). An empty subject
 /// becomes `"No subject"`. The Field Commander cannot receive player
-/// emails.
+/// emails. The id is the caller's when one is supplied, otherwise
+/// generated; appending is idempotent per phone, as for messages.
 pub async fn send_email(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -443,10 +541,14 @@ pub async fn send_email(
     let body_text = validate_non_empty(&body.body, "Email body is required.")?;
     validate_send_target(&from_uid, &to_uid, "emails")?;
     let timestamp = body.timestamp.unwrap_or_else(now_unix_f64);
+    let id = match body.id.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => sequence_id("phone-email", &from_uid, &to_uid),
+    };
 
     let db = db_or_503(&state).await?;
     let record = PhoneEmail {
-        id: sequence_id("phone-email", &from_uid, &to_uid),
+        id: id.clone(),
         from: from_uid.clone(),
         to: to_uid.clone(),
         subject,
@@ -467,14 +569,18 @@ pub async fn send_email(
             create_record(&db, PHONE_TABLE, &phone).await?
         }
     };
-    receiver.emails.push(record.clone());
-    save_phone(&db, &receiver).await?;
+    if !receiver.emails.iter().any(|e| e.id == id) {
+        receiver.emails.push(record.clone());
+        save_phone(&db, &receiver).await?;
+    }
     if from_uid != to_uid {
         let mut sender = load_phone(&db, &from_uid).await?;
-        let mut sender_copy = record.clone();
-        sender_copy.read = true;
-        sender.emails.push(sender_copy);
-        save_phone(&db, &sender).await?;
+        if !sender.emails.iter().any(|e| e.id == id) {
+            let mut sender_copy = record.clone();
+            sender_copy.read = true;
+            sender.emails.push(sender_copy);
+            save_phone(&db, &sender).await?;
+        }
     }
     Ok((StatusCode::CREATED, Json(json!(record))))
 }

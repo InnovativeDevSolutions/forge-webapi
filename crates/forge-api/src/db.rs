@@ -44,6 +44,7 @@ const TABLES: &[&str] = &[
     "player_locker",
     "player_vlocker",
     "player_phone",
+    "player_actor",
     "org",
 ];
 

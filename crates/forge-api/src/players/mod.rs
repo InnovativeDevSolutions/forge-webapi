@@ -57,6 +57,7 @@
 //!   `round_currency` does; bank balances are not rounded, as the
 //!   original's bank service does not round them.
 
+pub mod actor;
 pub mod bank;
 pub mod garage;
 pub mod locker;
@@ -236,6 +237,35 @@ where
             format!("Record '{key}' not found."),
         )),
     }
+}
+
+/// Delete records by a business-key field. Returns `true` when at
+/// least one record was deleted, `false` when nothing matched — the
+/// caller decides whether "nothing matched" is a 404 (record deletes)
+/// or a no-op (idempotent deletes).
+///
+/// `RETURN BEFORE` is required: a plain `DELETE ... WHERE` in
+/// SurrealDB 3.x returns an empty result even when it deleted rows,
+/// so the count can only be read from the before-image.
+pub async fn delete_by_field(
+    db: &Db,
+    table: &str,
+    key_field: &str,
+    key: &str,
+) -> Result<bool, (StatusCode, Json<Value>)> {
+    // Table and field names come from constants, never from user input;
+    // the value is a bound parameter.
+    let mut response = db
+        .query(format!(
+            "DELETE {table} WHERE {key_field} = $id RETURN BEFORE"
+        ))
+        .bind(("id", key.to_string()))
+        .await
+        .map_err(|error| db_err("delete record", error))?;
+    let deleted: Vec<Value> = response
+        .take(0)
+        .map_err(|error| db_err("delete record", error))?;
+    Ok(!deleted.is_empty())
 }
 
 /// Serialize a record for `update_record_content` / `create_record`.

@@ -842,6 +842,50 @@ pub async fn get_contract(State(state): State<AppState>, Path(id): Path<String>)
     }
 }
 
+/// POST /cad/contracts — seed one contract into the catalog (original
+/// `TaskService` catalog seeding). The CAD runtime itself stays
+/// in-memory by design and is not bridged; this endpoint only plants
+/// the catalog entry the API's list/get/assign/accept/decline/complete
+/// routes work over, so a server can pre-load its task catalog through
+/// the API instead of only through the in-game task system. 409 when a
+/// contract with that id already exists. A `createdAt` of zero is
+/// stamped with the current time.
+pub async fn seed_contract(
+    State(state): State<AppState>,
+    Json(mut body): Json<Contract>,
+) -> ApiResult {
+    let contract_id = body.contract_id.trim().to_string();
+    if contract_id.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Contract ID is required."));
+    }
+    body.contract_id = contract_id.clone();
+    if body.created_at == 0.0 {
+        body.created_at = now_unix() as f64;
+    }
+
+    let db = db_or_503(&state).await?;
+    let existing: Vec<Contract> =
+        select_by_field(&db, CONTRACT_TABLE, "contractId", &contract_id).await?;
+    if !existing.is_empty() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("Contract '{contract_id}' already exists"),
+        ));
+    }
+    let record = serde_json::to_value(&body).map_err(|error| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid contract: {error}"),
+        )
+    })?;
+    let _: Option<Value> = db
+        .create(CONTRACT_TABLE)
+        .content(record)
+        .await
+        .map_err(|error| db_err("create contract", error))?;
+    Ok((StatusCode::CREATED, Json(contract_json(&body))))
+}
+
 /// GET /cad/groups/:id/contracts — the contracts assigned to one group.
 /// 404 when the group does not exist; otherwise the group's contracts
 /// (assigned or accepted/active), each with its availability state.

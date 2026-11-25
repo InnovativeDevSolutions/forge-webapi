@@ -74,7 +74,10 @@ async fn main() -> Result<(), String> {
         .route("/cad/groups/{id}", get(cad::get_group))
         .route("/cad/groups/{id}/status", put(cad::update_group_status))
         .route("/cad/groups/{id}/contracts", get(cad::list_group_contracts))
-        .route("/cad/contracts", get(cad::list_contracts))
+        .route(
+            "/cad/contracts",
+            get(cad::list_contracts).post(cad::seed_contract),
+        )
         .route("/cad/contracts/{id}", get(cad::get_contract))
         .route("/cad/contracts/{id}/assign", post(cad::assign_contract))
         .route("/cad/contracts/{id}/accept", post(cad::accept_contract))
@@ -83,7 +86,10 @@ async fn main() -> Result<(), String> {
         // Player data: bank
         .route(
             "/players/{uid}/bank",
-            post(players::bank::create_bank).get(players::bank::get_bank),
+            post(players::bank::create_bank)
+                .get(players::bank::get_bank)
+                .put(players::bank::replace_bank)
+                .delete(players::bank::delete_bank),
         )
         .route("/players/{uid}/bank/deposit", post(players::bank::deposit))
         .route(
@@ -116,7 +122,8 @@ async fn main() -> Result<(), String> {
             "/players/{uid}/garage",
             post(players::garage::create_garage)
                 .get(players::garage::get_garage)
-                .put(players::garage::replace_garage),
+                .put(players::garage::replace_garage)
+                .delete(players::garage::delete_garage),
         )
         .route(
             "/players/{uid}/garage/vehicles",
@@ -129,7 +136,9 @@ async fn main() -> Result<(), String> {
         )
         .route(
             "/players/{uid}/vgarage",
-            post(players::garage::create_vgarage).get(players::garage::get_vgarage),
+            post(players::garage::create_vgarage)
+                .get(players::garage::get_vgarage)
+                .delete(players::garage::delete_vgarage),
         )
         .route(
             "/players/{uid}/vgarage/{category}",
@@ -145,7 +154,8 @@ async fn main() -> Result<(), String> {
             "/players/{uid}/locker",
             post(players::locker::create_locker)
                 .get(players::locker::get_locker)
-                .put(players::locker::replace_locker),
+                .put(players::locker::replace_locker)
+                .delete(players::locker::delete_locker),
         )
         .route(
             "/players/{uid}/locker/items",
@@ -157,7 +167,9 @@ async fn main() -> Result<(), String> {
         )
         .route(
             "/players/{uid}/vlocker",
-            post(players::locker::create_vlocker).get(players::locker::get_vlocker),
+            post(players::locker::create_vlocker)
+                .get(players::locker::get_vlocker)
+                .delete(players::locker::delete_vlocker),
         )
         .route(
             "/players/{uid}/vlocker/{category}",
@@ -171,7 +183,10 @@ async fn main() -> Result<(), String> {
         // Player data: phone
         .route(
             "/players/{uid}/phone",
-            post(players::phone::init_phone).get(players::phone::get_phone),
+            post(players::phone::init_phone)
+                .get(players::phone::get_phone)
+                .put(players::phone::replace_phone)
+                .delete(players::phone::delete_phone),
         )
         .route(
             "/players/{uid}/phone/contacts",
@@ -205,10 +220,23 @@ async fn main() -> Result<(), String> {
             "/players/{uid}/phone/emails/{emailId}",
             axum::routing::delete(players::phone::delete_email),
         )
+        // Player data: actor
+        .route(
+            "/players/{uid}/actor",
+            post(players::actor::create_actor)
+                .get(players::actor::get_actor)
+                .put(players::actor::replace_actor)
+                .delete(players::actor::delete_actor),
+        )
         // Player data: orgs
         .route("/orgs", post(players::org::register_org))
         .route("/orgs/invites", get(players::org::list_member_invites))
-        .route("/orgs/{id}", get(players::org::get_org))
+        .route(
+            "/orgs/{id}",
+            get(players::org::get_org)
+                .put(players::org::replace_org)
+                .delete(players::org::delete_org),
+        )
         .route(
             "/orgs/{id}/members",
             get(players::org::list_members).post(players::org::ensure_member),

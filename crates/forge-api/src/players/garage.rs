@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    create_record, db_or_503, err, load_by_field, select_by_field, to_content,
+    create_record, db_or_503, delete_by_field, err, load_by_field, select_by_field, to_content,
     update_record_content, ApiResult,
 };
 use crate::AppState;
@@ -371,6 +371,19 @@ pub async fn patch_vehicle(
     Ok((StatusCode::OK, Json(json!(saved))))
 }
 
+/// DELETE /players/{uid}/garage — remove a whole garage (original
+/// `GarageService::delete`). 404 when the player has no garage.
+pub async fn delete_garage(State(state): State<AppState>, Path(uid): Path<String>) -> ApiResult {
+    let db = db_or_503(&state).await?;
+    if !delete_by_field(&db, GARAGE_TABLE, "uid", &uid).await? {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("Garage for '{uid}' not found."),
+        ));
+    }
+    Ok((StatusCode::OK, Json(json!({ "deleted": true }))))
+}
+
 /// DELETE /players/{uid}/garage/vehicles/{plate} — remove a stored
 /// vehicle (original `remove_vehicle`). 404 when the garage or the
 /// vehicle does not exist.
@@ -580,6 +593,19 @@ pub async fn add_vgarage_classnames(
     }
     let saved = save_vgarage(&db, &vgarage).await?;
     Ok((StatusCode::OK, Json(json!(saved))))
+}
+
+/// DELETE /players/{uid}/vgarage — remove a whole virtual garage
+/// (original `VGarageService::delete`). 404 when the player has none.
+pub async fn delete_vgarage(State(state): State<AppState>, Path(uid): Path<String>) -> ApiResult {
+    let db = db_or_503(&state).await?;
+    if !delete_by_field(&db, VGARAGE_TABLE, "uid", &uid).await? {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("Virtual garage for '{uid}' not found."),
+        ));
+    }
+    Ok((StatusCode::OK, Json(json!({ "deleted": true }))))
 }
 
 /// DELETE /players/{uid}/vgarage/{category}/{classname} — remove one

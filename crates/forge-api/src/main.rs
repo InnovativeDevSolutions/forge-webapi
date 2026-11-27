@@ -5,6 +5,7 @@
 //! state lives in SurrealDB; this process is stateless.
 
 mod cad;
+mod common;
 mod config;
 mod cors;
 mod db;

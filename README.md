@@ -334,8 +334,12 @@ example for them.
 - [x] CAD: groups, group status, contract availability (+ assigned group)
 - [x] Task / contract lifecycle: assign / accept / decline, completion
 - [x] Player data: bank, garages, lockers, phones, orgs, stores
+- [x] Thin the Arma extension down to a bridge: player data (actor, bank,
+      garages, lockers, phones, orgs) persists only through the API
 - [ ] Auth for game servers and web UI clients
-- [ ] Thin the Arma extension down to a bridge (or remove it) once the API owns persistence
+- [ ] Contract completion log (task/CAD state itself stays per-mission in the
+      extension)
+- [x] Remove the extension's legacy SurrealDB migration path
 
 ## License
 

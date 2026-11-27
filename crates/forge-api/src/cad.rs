@@ -59,13 +59,10 @@
 //! ## Persistence
 //!
 //! Tables `cad_group` and `cad_contract` in SurrealDB. Lookups use the
-//! business keys (`group_id`, `contract_id`) as fields — the same
+//! business keys (`groupId`, `contractId`) as fields — the same
 //! select-by-field pattern the original extension uses
 //! (`arma/server/extension/src/storage/common.rs`) — so no record-id
 //! escaping questions arise for ids like `grp:1`.
-
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, Query, State},
@@ -75,96 +72,15 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::common::{
+    db_err, db_or_503, decode_record, err, now_unix, select_all, select_by_field, ApiResult,
+};
 use crate::{db::Db, AppState};
 
 /// SurrealDB table for CAD groups.
 pub const GROUP_TABLE: &str = "cad_group";
 /// SurrealDB table for CAD contracts (task catalog entries).
 pub const CONTRACT_TABLE: &str = "cad_contract";
-
-/// Shared result type: success and error both carry a status + JSON body.
-type ApiResult = Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)>;
-
-fn err(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({ "error": message.into() })))
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Require a database connection; the CAD routes are persistence routes, so
-/// they answer 503 while the API is running without SurrealDB (same
-/// degraded-mode pattern as `/health` reporting `database: "unavailable"`).
-async fn db_or_503(state: &AppState) -> Result<Arc<Db>, (StatusCode, Json<Value>)> {
-    match &state.db {
-        Some(db) => Ok(Arc::clone(db)),
-        None => Err(err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "database unavailable: SurrealDB is not connected",
-        )),
-    }
-}
-
-fn db_err(context: &str, error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
-    err(
-        StatusCode::BAD_GATEWAY,
-        format!("SurrealDB {context} failed: {error}"),
-    )
-}
-
-fn decode_record<T>(record: Value) -> Result<T, (StatusCode, Json<Value>)>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    serde_json::from_value(record).map_err(|error| {
-        err(
-            StatusCode::BAD_GATEWAY,
-            format!("SurrealDB decode failed: {error}"),
-        )
-    })
-}
-
-fn decode_records<T>(records: Vec<Value>) -> Result<Vec<T>, (StatusCode, Json<Value>)>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    records.into_iter().map(decode_record).collect()
-}
-
-async fn select_all<T>(db: &Db, table: &str) -> Result<Vec<T>, (StatusCode, Json<Value>)>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let values: Vec<Value> = db
-        .select(table)
-        .await
-        .map_err(|error| db_err("select", error))?;
-    decode_records(values)
-}
-
-async fn select_by_field<T>(
-    db: &Db,
-    table: &str,
-    field: &str,
-    value: &str,
-) -> Result<Vec<T>, (StatusCode, Json<Value>)>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    // Table and field names come from constants, never from user input; the
-    // value is a bound parameter.
-    let mut response = db
-        .query(format!("SELECT * FROM {table} WHERE {field} = $value"))
-        .bind(("value", value.to_string()))
-        .await
-        .map_err(|error| db_err("select", error))?;
-    let values: Vec<Value> = response.take(0).map_err(|error| db_err("select", error))?;
-    decode_records(values)
-}
 
 // ---------------------------------------------------------------------------
 // Groups
